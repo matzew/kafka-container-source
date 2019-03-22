@@ -3,17 +3,42 @@ package main
 import (
 	"context"
 	"flag"
+	"fmt"
 	"log"
 
-	"github.com/Shopify/sarama"
-	cluster "github.com/bsm/sarama-cluster"
+	sarama "github.com/Shopify/sarama"
 	"github.com/cloudevents/sdk-go/pkg/cloudevents"
 	"github.com/cloudevents/sdk-go/pkg/cloudevents/client"
 	"github.com/cloudevents/sdk-go/pkg/cloudevents/types"
 	"github.com/google/uuid"
 	"github.com/knative/eventing-sources/pkg/kncloudevents"
-	"github.com/knative/pkg/signals"
 )
+
+type consumerGroupHandler struct {
+	ceClient client.Client
+}
+
+func (consumerGroupHandler) Setup(_ sarama.ConsumerGroupSession) error {
+	return nil
+}
+func (consumerGroupHandler) Cleanup(_ sarama.ConsumerGroupSession) error { return nil }
+func (h consumerGroupHandler) ConsumeClaim(sess sarama.ConsumerGroupSession, claim sarama.ConsumerGroupClaim) error {
+	for msg := range claim.Messages() {
+		fmt.Printf("Message topic:%q partition:%d offset:%d\n", msg.Topic, msg.Partition, msg.Offset)
+		//go post(msg.Value, c)
+
+		event := cloudevents.Event{
+			Context: cloudevents.EventContextV02{
+				Type:   "kafka-event",
+				Source: *types.ParseURLRef(topic),
+			}.AsV02(),
+			Data: msg.Value,
+		}
+		go h.ceClient.Send(context.TODO(), event)
+		sess.MarkMessage(msg, "")
+	}
+	return nil
+}
 
 var (
 	sink      string
@@ -33,59 +58,51 @@ func main() {
 
 	flag.Parse()
 
-	kafkaConfig := cluster.NewConfig()
-	kafkaConfig.Group.Mode = cluster.ConsumerModePartitions
+	brokers := []string{bootstrap}
+	topics := []string{topic}
+
+	// kafka
+	kafkaConfig := sarama.NewConfig()
 	kafkaConfig.Consumer.Offsets.Initial = sarama.OffsetOldest
+	kafkaConfig.Version = sarama.V2_0_0_0
+	kafkaConfig.Consumer.Return.Errors = true
+
+	// Start with a client
+	client, err := sarama.NewClient(brokers, kafkaConfig)
+	if err != nil {
+		panic(err)
+	}
+	defer func() { _ = client.Close() }()
+
+	// init consumer group
+	group, err := sarama.NewConsumerGroupFromClient(groupID, client)
+	if err != nil {
+		panic(err)
+	}
+	defer func() { _ = group.Close() }()
+
+	// Track errors
+	go func() {
+		for err := range group.Errors() {
+			fmt.Println("ERROR", err)
+		}
+	}()
 
 	c, err := kncloudevents.NewDefaultClient(sink)
 	if err != nil {
 		log.Fatalf("failed to create client: %s", err.Error())
 	}
 
-	// init consumer
-	brokers := []string{bootstrap}
-	topics := []string{topic}
-
-	consumer, err := cluster.NewConsumer(brokers, groupID, topics, kafkaConfig)
-	if err != nil {
-		panic(err)
-	}
-	defer consumer.Close()
-
-	// trap SIGINT to trigger a shutdown.
-	stopCh := signals.SetupSignalHandler()
-
-	// consume messages, watch signals
+	// Iterate over consumer sessions.
+	ctx := context.Background()
 	for {
-		select {
-		case part, ok := <-consumer.Partitions():
-			if !ok {
-				return
-			}
-
-			// start a separate goroutine to consume messages
-			go func(pc cluster.PartitionConsumer) {
-				for msg := range pc.Messages() {
-					log.Printf("Received %s", msg.Value)
-					go post(msg.Value, c)
-					consumer.MarkOffset(msg, "") // mark message as processed
-				}
-			}(part)
-		case <-stopCh:
-			return
+		handler := consumerGroupHandler{
+			ceClient: c,
 		}
-	}
-}
 
-func post(data interface{}, c client.Client) {
-	event := cloudevents.Event{
-		Context: cloudevents.EventContextV02{
-			Type:   "kafka-event",
-			Source: *types.ParseURLRef(topic),
-		}.AsV02(),
-		Data: data,
-	}
-	if _, err := c.Send(context.TODO(), event); err != nil {
-		log.Printf("sending event to channel failed: %v", err)
+		err := group.Consume(ctx, topics, handler)
+		if err != nil {
+			panic(err)
+		}
 	}
 }
