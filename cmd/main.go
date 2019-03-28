@@ -24,8 +24,7 @@ func (consumerGroupHandler) Setup(_ sarama.ConsumerGroupSession) error {
 func (consumerGroupHandler) Cleanup(_ sarama.ConsumerGroupSession) error { return nil }
 func (h consumerGroupHandler) ConsumeClaim(sess sarama.ConsumerGroupSession, claim sarama.ConsumerGroupClaim) error {
 	for msg := range claim.Messages() {
-		fmt.Printf("Message topic:%q partition:%d offset:%d\n", msg.Topic, msg.Partition, msg.Offset)
-		//go post(msg.Value, c)
+		//fmt.Printf("Message topic:%q partition:%d offset:%d\n", msg.Topic, msg.Partition, msg.Offset)
 
 		event := cloudevents.Event{
 			Context: cloudevents.EventContextV02{
@@ -34,8 +33,15 @@ func (h consumerGroupHandler) ConsumeClaim(sess sarama.ConsumerGroupSession, cla
 			}.AsV02(),
 			Data: msg.Value,
 		}
-		go h.ceClient.Send(context.TODO(), event)
-		sess.MarkMessage(msg, "")
+
+		go func(msg *sarama.ConsumerMessage) {
+			// send and mark message if post was successfull
+			if _, err := h.ceClient.Send(context.TODO(), event); err == nil {
+				sess.MarkMessage(msg, "")
+			} else {
+				fmt.Printf("Sending event to sink failed")
+			}
+		}(msg)
 	}
 	return nil
 }
