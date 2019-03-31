@@ -34,14 +34,12 @@ func (h consumerGroupHandler) ConsumeClaim(sess sarama.ConsumerGroupSession, cla
 			Data: msg.Value,
 		}
 
-		go func(msg *sarama.ConsumerMessage) {
-			// send and mark message if post was successfull
-			if _, err := h.ceClient.Send(context.TODO(), event); err == nil {
-				sess.MarkMessage(msg, "")
-			} else {
-				fmt.Printf("Sending event to sink failed")
-			}
-		}(msg)
+		// send and mark message if post was successfull
+		if _, err := h.ceClient.Send(context.TODO(), event); err == nil {
+			sess.MarkMessage(msg, "")
+		} else {
+			fmt.Printf("Sending event to sink failed")
+		}
 	}
 	return nil
 }
@@ -99,16 +97,18 @@ func main() {
 		log.Fatalf("failed to create client: %s", err.Error())
 	}
 
-	// Iterate over consumer sessions.
 	ctx := context.Background()
-	for {
-		handler := consumerGroupHandler{
-			ceClient: c,
-		}
-
-		err := group.Consume(ctx, topics, handler)
-		if err != nil {
-			panic(err)
-		}
+	handler := consumerGroupHandler{
+		ceClient: c,
 	}
+
+	// Iterate over consumer sessions.
+	go func() {
+		for {
+			err := group.Consume(ctx, topics, handler)
+			if err != nil {
+				panic(err)
+			}
+		}
+	}()
 }
